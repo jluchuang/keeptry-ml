@@ -7,6 +7,7 @@ import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
 import org.apache.spark.sql.functions._
 
 import scala.collection.Map
+import scala.collection.mutable.ArrayBuffer
 import scala.util.Random
 
 object Audioscrobbler {
@@ -25,7 +26,8 @@ object Audioscrobbler {
         val rawArtistAlias = spark.read.textFile(BASE_PATH + "/" + "artist_alias.txt")
 
         val runRecommender = new RunRecommender(spark)
-        runRecommender.model(rawUserArtistData, rawArtistData, rawArtistAlias)
+        //        runRecommender.model(rawUserArtistData, rawArtistData, rawArtistAlias)
+        runRecommender.evaluate(rawUserArtistData, rawArtistAlias)
     }
 }
 
@@ -50,7 +52,7 @@ class RunRecommender(private val spark: SparkSession) {
         val artistAlias = buildArtistByAlias(rawArtistAlias)
 
         val (badID, goodID) = artistAlias.head
-        //        artistByID.filter($"id".isin(goodID, badID)).show
+        artistByID.filter($"id".isin(goodID, badID)).show
     }
 
     def buildArtistByID(rawArtistData: Dataset[String]): DataFrame = {
@@ -149,6 +151,127 @@ class RunRecommender(private val spark: SparkSession) {
                 .select("artist", "prediction")
                 .orderBy($"prediction".desc)
                 .limit(howMany)
+    }
+
+    def evaluate(rawUserArtistData: Dataset[String],
+                 rawAritsitAlias: Dataset[String]): Unit = {
+        val bArtistAlias = spark.sparkContext.broadcast(buildArtistByAlias(rawAritsitAlias))
+        val allData = buildCounts(rawUserArtistData, bArtistAlias)
+        val Array(trainData, cvData) = allData.randomSplit(Array(0.9, 0.1))
+        trainData.cache()
+        cvData.cache()
+
+        val allArtistIDs = allData.select("artist").as[Int].distinct().collect()
+        val bAllArtistIDs = spark.sparkContext.broadcast(allArtistIDs)
+
+        val mostListenedAUC = areaUnderCurve(cvData, bAllArtistIDs, predictMostListened(trainData))
+
+        println(mostListenedAUC)
+
+        val evaluations =
+            for (rank <- Seq(5, 30);
+                 regParam <- Seq(1.0, 0.0001);
+                 alpha <- Seq(1.0, 40.0))
+                yield {
+                    val model = new ALS().
+                            setSeed(Random.nextLong()).
+                            setImplicitPrefs(true).
+                            setRank(rank).setRegParam(regParam).
+                            setAlpha(alpha).setMaxIter(20).
+                            setUserCol("user").setItemCol("artist").
+                            setRatingCol("count").setPredictionCol("prediction").
+                            fit(trainData)
+
+                    val auc = areaUnderCurve(cvData, bAllArtistIDs, model.transform)
+
+                    model.userFactors.unpersist()
+                    model.itemFactors.unpersist()
+
+                    (auc, (rank, regParam, alpha))
+                }
+
+        evaluations.sorted.reverse.foreach(println)
+
+        trainData.unpersist()
+        cvData.unpersist()
+    }
+
+    def areaUnderCurve(positiveData: DataFrame,
+                       bAllArtistIDs: Broadcast[Array[Int]],
+                       predictFunction: (DataFrame => DataFrame)): Double = {
+        // What this actually computes is AUC, per user. the result is actually something
+        // that might be called "mean AUC"
+
+        // Take held-out data as the positive
+        // Make prediction for each of them, including a numeric score
+        val positivePredictions = predictFunction(positiveData.select("user", "artist"))
+                .withColumnRenamed("prediction", "positivePrediction")
+
+        // BinaryClassificationMetrics.areaUnderROC is not used here since there are really lots of
+        // small AUC problems, and it would be inefficient, when a direct computation is available
+
+        // Create a set of "negative" products for each user. These are randomly chosen
+        // from among all of the other artists, excluding those that are "positive" for the user
+        val negativeData = positiveData.select("user", "artist").as[(Int, Int)]
+                .groupByKey { case (user, _) => user }
+                .flatMapGroups {
+                    case (userID, userIDAndPosArtistIds) =>
+                        val random = new Random()
+                        val posItemIDSet = userIDAndPosArtistIds.map { case (_, artist) => artist }.toSet
+                        val negative = new ArrayBuffer[Int]()
+                        val allArtistIDs = bAllArtistIDs.value
+                        var i = 0
+                        // Make at most one pass over all artists to avoid an infinite loop.
+                        // Also stop when number of negative equals positive set size
+                        while (i < allArtistIDs.length && negative.size < posItemIDSet.size) {
+                            val artistID = allArtistIDs(random.nextInt(allArtistIDs.length))
+                            // Only add new distinct IDs
+                            if (!posItemIDSet.contains(artistID)) {
+                                negative += artistID
+                            }
+                            i += 1
+                        }
+                        negative.map(artistID => (userID, artistID))
+                }.toDF("user", "artist")
+
+        // Make predictions on the rest:
+        val negativePredictions = predictFunction(negativeData).
+                withColumnRenamed("prediction", "negativePrediction")
+
+        // Join positive predictions to negative predictions by user, only.
+        // This will result in a row for every possible pairing of positive and negative
+        // predictions within each user.
+        val joinedPredictions = positivePredictions.join(negativePredictions, "user").
+                select("user", "positivePrediction", "negativePrediction").cache()
+
+        // Count the number of pairs per user
+        val allCounts = joinedPredictions.
+                groupBy("user").agg(count(lit("1")).as("total")).
+                select("user", "total")
+        // Count the number of correctly ordered pairs per user
+        val correctCounts = joinedPredictions.
+                filter($"positivePrediction" > $"negativePrediction").
+                groupBy("user").agg(count("user").as("correct")).
+                select("user", "correct")
+
+        // Combine these, compute their ratio, and average over all users
+        val meanAUC = allCounts.join(correctCounts, Seq("user"), "left_outer").
+                select($"user", (coalesce($"correct", lit(0)) / $"total").as("auc")).
+                agg(mean("auc")).
+                as[Double].first()
+
+        joinedPredictions.unpersist()
+
+        meanAUC
+    }
+
+    def predictMostListened(train: DataFrame)(allData: DataFrame): DataFrame = {
+        val listenCounts = train.groupBy("artist")
+                .agg(sum("count").as("prediction"))
+                .select("artist", "prediction")
+
+        allData.join(listenCounts, Seq("artist"), "left_outer")
+                .select("user", "artist", "prediction")
     }
 }
 
