@@ -10,13 +10,14 @@
 
     <properties>
         <spark-version>2.3.1</spark-version>
+        <scala-version>2.11.8</scala-version>
     </properties>
 
     <dependencies>
         <dependency>
             <groupId>org.scala-lang</groupId>
             <artifactId>scala-library</artifactId>
-            <version>2.11.0</version>
+            <version>${scala-version}</version>
         </dependency>
         <dependency>
             <groupId>org.apache.spark</groupId>

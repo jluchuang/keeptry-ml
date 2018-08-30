@@ -1,6 +1,6 @@
-package com.xiaomi.teg.demo.music.als
+package cn.keeptry.ml.als
 
-import com.xiaomi.teg.demo.music.als.Audioscrobbler.BASE_PATH
+import Audioscrobbler.BASE_PATH
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.ml.recommendation.{ALS, ALSModel}
 import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
@@ -209,7 +209,7 @@ class RunRecommender(private val spark: SparkSession) {
                 setRatingCol("count").setPredictionCol("prediction").
                 fit(allData)
         allData.unpersist()
-
+        
         val userID = 2093760
         val topRecommendations = makeRecommendations(model, userID, 5)
 
